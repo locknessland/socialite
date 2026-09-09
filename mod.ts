@@ -29,6 +29,160 @@
  */
 
 import type { Context } from 'hono'
+import { isExplicitlyDevelopment } from '@lockness/contract'
+import { crypto as stdCrypto } from '@std/crypto'
+import { encodeBase64Url } from '@std/encoding/base64url'
+
+/**
+ * Name of the short-lived cookie that carries the OAuth `state` value between
+ * {@link BaseOAuth2Driver.redirect} and {@link BaseOAuth2Driver.user}. The
+ * cookie is HttpOnly, so an attacker can neither read nor set it; comparing it
+ * to the `state` echoed back in the callback query is the standard
+ * double-submit defence against OAuth login-CSRF (#169).
+ */
+const OAUTH_STATE_COOKIE = 'lockness_oauth_state'
+
+/** Seconds the state cookie stays valid — long enough for the round-trip. */
+const OAUTH_STATE_TTL = 600
+
+/**
+ * Build the `Set-Cookie` header value for the OAuth state cookie.
+ *
+ * `Secure` is derived fail-closed: on unless the environment is explicitly
+ * development, so the cookie is only sent over plaintext HTTP on a localhost dev
+ * setup (matches the session cookie posture). `SameSite=Lax` is required so the
+ * cookie survives the top-level redirect back from the provider.
+ *
+ * @param state - The state value to store.
+ * @returns The serialized `Set-Cookie` value.
+ */
+function buildStateCookie(state: string): string {
+    return buildShortLivedCookie(OAUTH_STATE_COOKIE, state, OAUTH_STATE_TTL)
+}
+
+/**
+ * Serialize a short-lived, HttpOnly OAuth cookie (state or PKCE verifier) with
+ * the shared posture: `Path=/`, the given `Max-Age`, `HttpOnly`, `SameSite=Lax`
+ * (survives the top-level redirect back), and `Secure` unless the environment is
+ * explicitly development. The single home for that cookie posture.
+ *
+ * @param name - The cookie name (already `__Host-`-prefixed by the caller where
+ *   applicable).
+ * @param value - The cookie value.
+ * @param ttlSeconds - `Max-Age` in seconds.
+ * @returns The serialized `Set-Cookie` value.
+ */
+function buildShortLivedCookie(
+    name: string,
+    value: string,
+    ttlSeconds: number,
+): string {
+    const attrs = [
+        `${name}=${value}`,
+        'Path=/',
+        `Max-Age=${ttlSeconds}`,
+        'HttpOnly',
+        'SameSite=Lax',
+    ]
+    if (!isExplicitlyDevelopment()) attrs.push('Secure')
+    return attrs.join('; ')
+}
+
+/**
+ * Read a single cookie value from a raw `Cookie` header.
+ *
+ * @param header - The request's `Cookie` header, if any.
+ * @param name - The cookie name to extract.
+ * @returns The decoded value, or `undefined` when absent.
+ */
+function readCookie(
+    header: string | undefined,
+    name: string,
+): string | undefined {
+    if (!header) return undefined
+    for (const part of header.split(';')) {
+        const eq = part.indexOf('=')
+        if (eq === -1) continue
+        if (part.slice(0, eq).trim() === name) {
+            return part.slice(eq + 1).trim()
+        }
+    }
+    return undefined
+}
+
+// ============================================================================
+// PKCE (RFC 7636, S256) — #243
+// ============================================================================
+
+/**
+ * Base name of the short-lived cookie carrying the PKCE `code_verifier` between
+ * {@link BaseOAuth2Driver.redirect} and {@link BaseOAuth2Driver.user}. Prefixed
+ * with `__Host-` when the cookie is `Secure` (see {@link verifierCookieName}).
+ */
+const OAUTH_VERIFIER_COOKIE = 'lockness_pkce_verifier'
+
+/** Seconds the verifier cookie stays valid — the auth round-trip window. */
+const OAUTH_VERIFIER_TTL = 600
+
+/**
+ * Resolve the verifier cookie name. In production the cookie is `Secure`, so it
+ * takes the `__Host-` prefix (locking it to this host, `Path=/`, no `Domain`);
+ * on the explicit-development plaintext path the prefix is dropped, since
+ * `__Host-` requires `Secure`. Both the writer ({@link buildPkceCookie}) and the
+ * reader ({@link BaseOAuth2Driver.user}) must agree — this is their single home.
+ *
+ * @returns The cookie name for the current environment.
+ */
+function verifierCookieName(): string {
+    return isExplicitlyDevelopment()
+        ? OAUTH_VERIFIER_COOKIE
+        : `__Host-${OAUTH_VERIFIER_COOKIE}`
+}
+
+/**
+ * Generate a PKCE `code_verifier`: base64url-unpadded of 32 CSPRNG bytes — 43
+ * characters from RFC 7636 §4.1's unreserved set, 256 bits of entropy.
+ *
+ * @returns A fresh code verifier.
+ */
+export function generatePkceVerifier(): string {
+    return encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)))
+}
+
+/**
+ * Derive the PKCE `code_challenge` from a verifier:
+ * BASE64URL-UNPADDED(SHA-256(ASCII(verifier))) — the S256 method.
+ *
+ * Uses `@std/crypto`'s synchronous `digestSync` so {@link BaseOAuth2Driver.redirect}
+ * stays synchronous; the digest input is the ASCII of the verifier STRING, never
+ * the raw random bytes.
+ *
+ * @param verifier - The code verifier produced by {@link generatePkceVerifier}.
+ * @returns The S256 code challenge.
+ */
+export function pkceChallenge(verifier: string): string {
+    const digest = stdCrypto.subtle.digestSync(
+        'SHA-256',
+        new TextEncoder().encode(verifier),
+    )
+    return encodeBase64Url(new Uint8Array(digest))
+}
+
+/**
+ * Build the `Set-Cookie` value for the PKCE verifier cookie, mirroring the state
+ * cookie's posture: HttpOnly, `SameSite=Lax` (survives the top-level redirect
+ * back), `Secure` unless explicitly development, short `Max-Age`.
+ *
+ * @param verifier - The verifier to store.
+ * @returns The serialized `Set-Cookie` value.
+ */
+function buildPkceCookie(verifier: string): string {
+    return buildShortLivedCookie(
+        verifierCookieName(),
+        verifier,
+        OAUTH_VERIFIER_TTL,
+    )
+}
 
 // ============================================================================
 // Types
@@ -84,7 +238,7 @@ export interface SocialiteDriver {
     /** Get the authorization URL */
     getAuthUrl(state?: string): string
     /** Exchange code for tokens */
-    getTokens(code: string): Promise<OAuthTokens>
+    getTokens(code: string, codeVerifier?: string): Promise<OAuthTokens>
     /** Get user info from tokens */
     getUserFromTokens(tokens: OAuthTokens): Promise<SocialUser>
     /** Generate redirect response */
@@ -120,6 +274,15 @@ export function getSocialiteConfig(): SocialiteConfig {
 export abstract class BaseOAuth2Driver implements SocialiteDriver {
     constructor(protected config: ProviderConfig) {}
 
+    /**
+     * Whether this provider participates in PKCE (RFC 7636, S256). Default
+     * **on** (opt-out, #243): all bundled providers support S256. A custom or
+     * legacy driver whose provider rejects an unknown `code_challenge` sets this
+     * `false` to fall back to the pre-PKCE behaviour. Fail-closed posture of
+     * epic #164.
+     */
+    protected usesPkce = true
+
     /** Authorization endpoint URL */
     protected abstract authUrl: string
 
@@ -153,21 +316,35 @@ export abstract class BaseOAuth2Driver implements SocialiteDriver {
         return `${this.authUrl}?${params.toString()}`
     }
 
-    /** Exchange authorization code for tokens */
-    async getTokens(code: string): Promise<OAuthTokens> {
+    /**
+     * Exchange authorization code for tokens.
+     *
+     * @param code - The authorization code from the callback.
+     * @param codeVerifier - The PKCE verifier (#243); included as `code_verifier`
+     *   when present. A custom override must forward this to keep PKCE binding.
+     * @returns The provider's token response.
+     * @throws {Error} When the token endpoint responds with a non-OK status.
+     */
+    async getTokens(
+        code: string,
+        codeVerifier?: string,
+    ): Promise<OAuthTokens> {
+        const body = new URLSearchParams({
+            client_id: this.config.clientId,
+            client_secret: this.config.clientSecret,
+            code,
+            redirect_uri: this.config.redirectUri,
+            grant_type: 'authorization_code',
+        })
+        if (codeVerifier) body.set('code_verifier', codeVerifier)
+
         const response = await fetch(this.tokenUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
                 Accept: 'application/json',
             },
-            body: new URLSearchParams({
-                client_id: this.config.clientId,
-                client_secret: this.config.clientSecret,
-                code,
-                redirect_uri: this.config.redirectUri,
-                grant_type: 'authorization_code',
-            }),
+            body,
         })
 
         if (!response.ok) {
@@ -181,16 +358,62 @@ export abstract class BaseOAuth2Driver implements SocialiteDriver {
     /** Get user info from tokens - implemented by each provider */
     abstract getUserFromTokens(tokens: OAuthTokens): Promise<SocialUser>
 
-    /** Generate redirect response to authorization URL */
+    /**
+     * Generate a redirect response to the authorization URL.
+     *
+     * When no `state` is supplied one is generated, and it is stored in a
+     * short-lived HttpOnly cookie on the response so {@link user} can verify the
+     * callback against it — making the ergonomic path CSRF-safe by default
+     * (#169). Pass an explicit `state` only to manage it yourself.
+     *
+     * When {@link usesPkce} is on, it also mints a PKCE `code_verifier`, appends
+     * the S256 `code_challenge` to the authorization URL, and carries the
+     * verifier in a second HttpOnly cookie (#243). The challenge is appended
+     * HERE, not in {@link getAuthUrl}, so no driver override can strip it.
+     *
+     * @param state - Optional explicit state value; generated when omitted.
+     * @returns A 302 response to the provider, carrying the state (and, when
+     *   PKCE is on, the verifier) cookie.
+     */
     redirect(state?: string): Response {
-        const url = this.getAuthUrl(state)
-        return new Response(null, {
-            status: 302,
-            headers: { Location: url },
-        })
+        const resolvedState = state ?? generateState()
+        const headers = new Headers()
+        headers.append('Set-Cookie', buildStateCookie(resolvedState))
+
+        let url = this.getAuthUrl(resolvedState)
+        if (this.usesPkce) {
+            const verifier = generatePkceVerifier()
+            const pkce = new URLSearchParams({
+                code_challenge: pkceChallenge(verifier),
+                code_challenge_method: 'S256',
+            })
+            url += (url.includes('?') ? '&' : '?') + pkce.toString()
+            headers.append('Set-Cookie', buildPkceCookie(verifier))
+        }
+
+        headers.set('Location', url)
+        return new Response(null, { status: 302, headers })
     }
 
-    /** Get user from callback request */
+    /**
+     * Resolve the authenticated user from an OAuth callback request.
+     *
+     * Verifies the `state` query parameter against the state cookie set by
+     * {@link redirect} and rejects on any absence or mismatch — the OAuth
+     * login-CSRF defence (#169) — before exchanging the code for tokens.
+     *
+     * When {@link usesPkce} is on, it also reads the verifier cookie set by
+     * {@link redirect} and includes `code_verifier` in the token exchange; an
+     * absent verifier fails closed (#243) — a code without its verifier is an
+     * interrupted or forged flow, never a fallback to no-PKCE. The verifier
+     * value is used only in the token body — never logged or echoed in an error.
+     *
+     * @param c - The callback request context.
+     * @returns The normalised social user.
+     * @throws {Error} When the provider returned an error, no code is present,
+     *   the `state` is missing or does not match the cookie, or PKCE is on and
+     *   the verifier cookie is absent.
+     */
     async user(c: Context): Promise<SocialUser> {
         const code = c.req.query('code')
 
@@ -204,7 +427,41 @@ export abstract class BaseOAuth2Driver implements SocialiteDriver {
             )
         }
 
-        const tokens = await this.getTokens(code)
+        // Fail closed on the state check: an absent or mismatched state is a
+        // possible login-CSRF and must never proceed to a token exchange.
+        const expectedState = readCookie(
+            c.req.header('Cookie'),
+            OAUTH_STATE_COOKIE,
+        )
+        const returnedState = c.req.query('state')
+        if (
+            !expectedState || !returnedState || expectedState !== returnedState
+        ) {
+            throw new Error(
+                'OAuth state mismatch: missing or invalid state (possible CSRF). ' +
+                    'Start the flow via redirect() so the state cookie is set.',
+            )
+        }
+
+        // Fail closed on PKCE: when this provider uses PKCE, the verifier cookie
+        // set by redirect() must be present. Its absence is an interrupted or
+        // forged flow — never exchange the code without the verifier. The value
+        // is never interpolated into this message (#243, FR-009).
+        let codeVerifier: string | undefined
+        if (this.usesPkce) {
+            codeVerifier = readCookie(
+                c.req.header('Cookie'),
+                verifierCookieName(),
+            )
+            if (!codeVerifier) {
+                throw new Error(
+                    'OAuth PKCE verifier missing (possible interrupted or forged flow). ' +
+                        'Start the flow via redirect() so the verifier cookie is set.',
+                )
+            }
+        }
+
+        const tokens = await this.getTokens(code, codeVerifier)
         return await this.getUserFromTokens(tokens)
     }
 }
